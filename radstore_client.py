@@ -17,22 +17,32 @@ def encode(obj):
 
 
 def _post(url, data, **kwargs):
-	resp = requests.post(url, data=json.dumps(data, default=encode), 
+	resp = requests.post(url, data=json.dumps(data, default=encode),
 		headers={'Content-Type':'application/json'})
 	if not resp.ok:
 		raise Exception("error: %d: %s", resp.status_code, resp.reason)
 	data = resp.json()
-	if data['status'] != 'ok': 
+	if data['status'] != 'ok':
+		raise Exception("error: %s: %s", data['status'], data.get('message',''))
+	return data['data']
+
+def _put(url, data, **kwargs):
+	resp = requests.put(url, data=json.dumps(data, default=encode),
+		headers={'Content-Type':'application/json'})
+	if not resp.ok:
+		raise Exception("error: %d: %s", resp.status_code, resp.reason)
+	data = resp.json()
+	if data['status'] != 'ok':
 		raise Exception("error: %s: %s", data['status'], data.get('message',''))
 	return data['data']
 
 def _post_binary(url, data):
-	resp = requests.post(url, data=data, 
+	resp = requests.post(url, data=data,
 		headers={'Content-Type':'application/octet-stream'})
 	if not resp.ok:
 		raise Exception("error: %d: %s", resp.status_code, resp.reason)
 	data = resp.json()
-	if data['status'] != 'ok': 
+	if data['status'] != 'ok':
 		raise Exception("error: %s: %s", data['status'], data.get('message',''))
 	return data['data']
 
@@ -42,7 +52,7 @@ def _get(*args, **kwargs):
 	if not resp.ok:
 		raise Exception("error: %d: %s", resp.status_code, resp.reason)
 	data = resp.json()
-	if data['status'] != 'ok': 
+	if data['status'] != 'ok':
 		raise Exception("error: %s: %s", data['status'], data.get('message',''))
 	return data['data']
 
@@ -71,11 +81,18 @@ class Query(object):
 		self._limit = lim
 		return self
 
+	def _parse_params(self, prefix, par):
+		if not isinstance(par,dict): return {'.'.join(prefix): par}
+		ans = {}
+		for k,v in par.items():
+			ans.update(self._parse_params(prefix+[k], v))
+		return ans
+
 	def _get_list(self):
 		url = '%s/%s' % (config.base_url, self.cls.endpoint)
-		par = self.params.copy()
+		par = self._parse_params([],self.params)
 		if self._limit is not None: par['limit'] = self._limit
-		if self._offset is not None: par['offset'] = self._offset		
+		if self._offset is not None: par['offset'] = self._offset
 		return _get(url, params=par)
 
 	def all(self):
@@ -87,26 +104,28 @@ class Query(object):
 	def count(self):
 		return self._get_list()['count']
 
+	def exists(self):
+		return self._get_list()['count'] > 0
+
 
 class Resource(object):
-	normal_attributes = ['_id','metadata']
-
 	def __init__(self, params={}):
 		self._id = None
-		self.metadata = {}
+		self._metadata = {}
 		for k,v in params.items():
 			setattr(self, k, v)
 
 	def __getattr__(self, name):
-		return self.metadata[name]
+		if name[0] == '_': return super(Resource, self).__getattr__(self, name)
+		else: return self._metadata[name]
 
 	def __setattr__(self, name, value):
-		if name in self.normal_attributes: super(Resource, self).__setattr__(name, value)
-		else: self.metadata[name] = value
+		if name[0] == '_': super(Resource, self).__setattr__(name, value)
+		else: self._metadata[name] = value
 
 	def copy(self):
 		outp = self.__class__()
-		outp.metadata = self.metadata.copy()
+		outp._metadata = self._metadata.copy()
 		return outp
 
 	@classmethod
@@ -118,36 +137,41 @@ class Resource(object):
 		return Query(cls).filter(_id=id).first()
 
 	def save(self):
-		if self._id is None:			
-			resp = _post('%s/%s' % (config.base_url, self.endpoint), data=self.metadata)
+		if self._id is None:
+			resp = _post('%s/%s' % (config.base_url, self.endpoint), data=self._metadata)
 			self._id = resp[self.class_name_singular]['_id']
-
+		else:
+			resp = _put('%s/%s/%s' % (config.base_url, self.endpoint, self._id), data=self._metadata)
 
 class Product(Resource):
 	endpoint = 'products'
 	class_name_singular = 'product'
 	class_name_plural = 'products'
 
-	normal_attributes = ['_id','metadata', 'content', '_content']
-	
 	def __init__(self, params={}):
 		super(Product, self).__init__(params)
+		self._content_dirty = False
 
-	def save_content(self):
-		if self._id is None:
-			raise Exception("save instance first")
-		_post_binary('%s/%s/%s/content' % (config.base_url, self.endpoint, self._id), data=self.content)
+	def save(self):
+		super(Product, self).save()
+		if self._content_dirty:
+			_post_binary('%s/%s/%s/content' % (config.base_url, self.endpoint, self._id), data=self.content)
+			self._content_dirty = False
+
+	def __setattr__(self, name, value):
+		if name == 'content': self.set_content(value)
+		else: super(Product, self).__setattr__(name, value)
 
 	@property
 	def content(self):
 		if not hasattr(self, '_content'):
-			self.__dict__['_content'] = _get_binary('%s/%s/%s/content' % (config.base_url, self.endpoint, self._id)).content
+			self._content = _get_binary('%s/%s/%s/content' % (config.base_url, self.endpoint, self._id)).content
+			self._content_dirty = False
 		return self._content
 
-	@content.setter
-	def content(self, value):
+	def set_content(self, value):
 		self._content = value
-
+		self._content_dirty = True
 
 class Transformation(Resource):
 	endpoint = 'transformations'
@@ -155,15 +179,15 @@ class Transformation(Resource):
 	class_name_plural = 'transformations'
 
 	def add_input(self, prod):
-		if 'inputs' not in self.metadata: 
-			self.metadata['inputs'] = []
-		self.metadata['inputs'].append({'_id': prod._id})
+		if 'inputs' not in self._metadata:
+			self._metadata['inputs'] = []
+		self._metadata['inputs'].append({'_id': prod._id})
 		return self
 
 	def add_output(self, prod):
-		if 'outputs' not in self.metadata: 
-			self.metadata['outputs'] = []
-		self.metadata['outputs'].append({'_id': prod._id})
+		if 'outputs' not in self._metadata:
+			self._metadata['outputs'] = []
+		self._metadata['outputs'].append({'_id': prod._id})
 		return self
 
 
@@ -171,14 +195,16 @@ def _parse_arg(arg):
 	i = arg.index('=')
 	return arg[:i],arg[i+1:]
 
-def parse_cmdline(params):
-	cmd = None
-	if len(params)>1:
-		cmd = params[1]
+def parse_cmdline(params, cmd=True):
+	_cmd = None
+	if _cmd and len(params)>1:
+		_cmd = params[1]
+		params = params[1:]
 	args = {}
-	if len(params)>2:
-		args = dict(map(_parse_arg, params[2:]))
-	return cmd, args
+	if len(params)>1:
+		args = dict(map(_parse_arg, params[1:]))
+	if cmd: return _cmd, args
+	else: return args
 
 
 # for testing
