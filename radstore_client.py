@@ -192,12 +192,18 @@ class Transformation(Resource):
 
 
 def _parse_arg(arg):
-	i = arg.index('=')
-	return arg[:i],arg[i+1:]
+	if '=' in arg:
+		i = arg.index('=')
+		return arg[:i],arg[i+1:]
+
+	if arg.startswith('--'):
+		return arg[2:],None
+
+	return arg,None
 
 def parse_cmdline(params, cmd=True):
 	_cmd = None
-	if _cmd and len(params)>1:
+	if cmd and len(params)>1:
 		_cmd = params[1]
 		params = params[1:]
 	args = {}
